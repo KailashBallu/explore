@@ -1,6 +1,6 @@
 # Meeting Intelligence — Technical Design Document
 
-> **Version:** 1.0  
+> **Version:** 1.1  
 > **Date:** 2026-05-18  
 > **Status:** Planning
 
@@ -498,7 +498,176 @@ A chat interface can serve as an alternative to the upload wizard and as a revie
 
 ---
 
-## 9. Key Decisions
+## 9. Evaluation Framework
+
+Quality evaluation is critical because the output is a legally-significant document. The evaluation system serves two audiences: developers (prompt engineering, regression testing) and end users (quality visibility, feedback loop).
+
+### 9.1 Evaluation Dimensions
+
+Each generated minutes section is scored on these dimensions:
+
+| Dimension | Description | Measured By |
+|-----------|-------------|-------------|
+| **Accuracy** | Does the summary faithfully reflect the source transcript? No fabricated facts. | LLM-as-judge |
+| **Completeness** | Are all key discussion points captured? No important omissions. | LLM-as-judge |
+| **Speaker attribution** | Are points correctly attributed to the right speakers? (SEA requirement) | Deterministic + LLM-as-judge |
+| **Structural validity** | Are all required sections present? Source links within bounds? | Deterministic |
+| **Language quality** | Grammar, spelling, appropriate formality for minutes. | LLM-as-judge |
+| **Conciseness** | Appropriate density — matches user's preferred level of detail. | LLM-as-judge (vs user preference) |
+
+### 9.2 Automated Structural Checks (Deterministic)
+
+These run as part of the `validate_minutes` node and after every generation. Always computed, zero LLM cost.
+
+```
+Check                                    | Severity
+-----------------------------------------|----------
+All agenda items have a summary section  | ERROR
+Speaker name present on every point      | WARNING (SEA requirement)
+Source character ranges within transcript bounds | ERROR
+Source time ranges within recording duration     | ERROR
+No empty/placeholder sections            | ERROR
+Section ordinals are sequential          | WARNING
+Attendance list matches input metadata   | WARNING
+```
+
+### 9.3 LLM-as-Judge (Automated)
+
+A separate LLM call (different model or provider from generation) evaluates each section against the source transcript. This is the core automated quality metric.
+
+**Approach**: Provide the judge LLM with:
+1. The original transcript segment (source of truth)
+2. The generated summary/motion/action item
+3. A scoring rubric with 1–5 scale per dimension
+
+**Judge prompt structure**:
+```
+You are evaluating the quality of meeting minutes generated from a transcript.
+
+Source transcript segment:
+---
+{transcript_chunk}
+---
+
+Generated minutes section:
+---
+{generated_section}
+---
+
+Score each dimension 1-5 (1=poor, 5=excellent):
+
+1. Accuracy: Does the summary faithfully reflect the source? No hallucinations?
+2. Completeness: Are all key points from the source captured?
+3. Speaker attribution: Are points attributed to the correct speakers?
+4. Language quality: Grammar, spelling, appropriate formality?
+
+For each score, provide a brief justification and the specific source text
+that supports or contradicts the generated text.
+```
+
+**Why a separate LLM**: Using the same model to generate and evaluate risks self-confirmation bias. The judge should be a different model or at minimum a separate, zero-temperature call.
+
+**Cost**: Per 2-hour meeting (~7 agenda items): ~8 judge calls (one per agenda item + motions + actions). Approximately 15–20k additional tokens per meeting.
+
+### 9.4 Development Evaluation Loop
+
+During prompt engineering and model evaluation:
+1. Generate minutes for a test meeting → get scores
+2. Change prompt/model → generate again → compare scores
+3. Track score trends over time (stored in DB alongside each generation)
+4. Flag regressions: if any dimension drops >0.5 points, alert the developer
+
+This makes prompt iteration data-driven rather than subjective.
+
+### 9.5 User-Facing Quality Scores
+
+Each section in the review editor shows a quality indicator:
+
+```
+┌─────────────────────────────────────────┐
+│ 1. Financial Review          Accuracy ●●●●○ 4.2  │
+│    Mr. Tan presented the Q1  Completeness ●●●●○ 3.8 │
+│    financial results...      Attribution ●●●●● 5.0  │
+│                              [flag for review]       │
+└─────────────────────────────────────────┘
+```
+
+- Scores shown as 1–5 dots with numeric value
+- Sections scoring below threshold (e.g., <3.5) are highlighted in yellow
+- Users can click "flag for review" on any section regardless of score
+- Aggregate meeting-level score shown in dashboard
+
+### 9.6 User Feedback Collection
+
+Embedded in the review editor:
+- **Per-section**: thumbs up/down, flag for review, free-text note
+- **Per-meeting**: overall satisfaction rating, free-text feedback
+- **Post-export**: optional NPS-style question ("How much editing was needed?")
+
+This feedback data is stored and used to:
+- Identify systematic issues (e.g., a prompt that consistently misses action items)
+- Calibrate the LLM-as-judge scores against real user satisfaction
+- Prioritize improvements
+
+### 9.7 Style Customization via User Samples
+
+Users can upload example minutes they've written or approved to customize output style. This addresses the fact that different organizations prefer different levels of detail.
+
+**How it works**:
+1. User uploads 1–3 example minutes documents they consider "gold standard"
+2. System extracts style characteristics via LLM analysis:
+   - Conciseness: average words per agenda item
+   - Formality level: vocabulary, sentence structure
+   - Detail density: are motions described in detail or summarized?
+   - Structural preferences: section ordering, heading style
+3. A style profile (JSON) is stored on the user record
+4. The `summarize_agenda_item` node receives the style profile as part of its prompt:
+
+```
+Style preferences for this organization:
+- Conciseness: concise (prefer bullet points over paragraphs)
+- Formality: high (use formal board-meeting language)
+- Detail: motions should include full voting breakdowns
+```
+
+**Why not few-shot prompting directly**: Few-shot with full example minutes would blow the context window. Extracting a style profile is token-efficient and reusable across all future generations.
+
+### 9.8 Data Model Additions
+
+```sql
+-- Per-generation evaluation scores
+generation_evals (
+  id, meeting_id, minutes_id, section_id, eval_method,  -- eval_method: structural | llm_judge | user
+  accuracy_score, completeness_score, attribution_score,
+  language_score, conciseness_score,
+  judge_model, judge_raw_response, created_at
+)
+
+-- User feedback on generated content
+section_feedback (
+  id, section_id, user_id, rating,  -- rating: thumbs_up | thumbs_down | flag
+  free_text, created_at
+)
+
+-- User style profile
+user_style_profiles (
+  id, user_id, style_config (JSONB),
+  source_minutes_ids, created_at, updated_at
+)
+```
+
+### 9.9 API Additions
+
+```
+GET    /api/meetings/:id/minutes/:vid/evaluation    # Get quality scores for all sections
+POST   /api/meetings/:id/minutes/:vid/sections/:sid/feedback  # Submit user feedback
+GET    /api/users/me/style-profile                  # Get current style profile
+POST   /api/users/me/style-profile/samples          # Upload example minutes for style extraction
+```
+
+---
+
+## 10. Key Decisions
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|

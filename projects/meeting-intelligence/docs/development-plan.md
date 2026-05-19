@@ -1,6 +1,6 @@
 # Meeting Intelligence — Development Plan
 
-> **Version:** 1.0  
+> **Version:** 1.1  
 > **Date:** 2026-05-18  
 > **Status:** Planning
 
@@ -71,7 +71,7 @@ POST /api/meetings/:id/upload
 
 ### Phase 3: LangGraph Minutes Generation Graph
 
-**Goal**: Multi-step agentic workflow that transforms transcript + metadata into structured minutes.
+**Goal**: Multi-step agentic workflow that transforms transcript + metadata into structured minutes with automated quality evaluation.
 
 - Define `MinutesState` TypedDict and state schema
 - Implement all 10 graph nodes:
@@ -84,14 +84,19 @@ POST /api/meetings/:id/upload
   - `extract_action_items` — LLM: extract action items
   - `extract_next_meeting` — LLM: extract next meeting info
   - `assemble_minutes` — deterministic: compile into JSONB
-  - `validate_minutes` — quality gate with retry loop
+  - `validate_minutes` — deterministic structural checks + quality gate with retry loop
 - Wire conditional edges (recording vs transcript branch, validation pass/fail)
 - Implement `Send()` fan-out for parallel agenda item summarization
 - Configure `PostgresSaver` checkpointing
 - Wire `astream_events()` progress streaming → Redis pub/sub
+- **Evaluation — Automated scoring**:
+  - Deterministic structural checks in `validate_minutes`
+  - LLM-as-judge evaluation node that scores each section post-generation (separate model/call)
+  - Store scores in `generation_evals` table
+  - Return scores alongside minutes to frontend
 - Celery task that instantiates and runs the graph
 
-**Deliverable**: Celery task accepts meeting_id → LangGraph workflow runs end-to-end → structured minutes with traceability links stored in DB.
+**Deliverable**: Celery task accepts meeting_id → LangGraph workflow runs end-to-end → structured minutes with traceability links AND quality scores stored in DB.
 
 ---
 
@@ -113,13 +118,26 @@ POST /api/meetings/:id/upload
 
 ---
 
-### Phase 5: Export & Polish
+### Phase 5: Export, Polish & User-Facing Evaluation
 
-**Goal**: Production-grade quality and export capabilities.
+**Goal**: Production-grade quality, export capabilities, and user-facing evaluation features.
 
 - DOCX export with professional formatting (headings, tables, page numbers)
 - PDF export (via WeasyPrint from DOCX)
 - Version history for minutes (list versions, view diffs, restore)
+- **User-facing quality scores**:
+  - Display per-section scores (dots + numeric) in review editor
+  - Highlight sections below quality threshold
+  - Aggregate meeting-level quality indicator on dashboard
+- **User feedback collection**:
+  - Per-section thumbs up/down, flag for review, free-text notes
+  - Per-meeting satisfaction rating
+  - Store feedback in `section_feedback` table for analysis
+- **Style customization via samples**:
+  - User uploads 1–3 example minutes they consider "gold standard"
+  - LLM extracts style profile (conciseness, formality, detail density, structure)
+  - Style profile injected into generation prompts
+  - Re-generate respects the learned style
 - Error handling & edge cases:
   - Long meetings (>4 hours): increased chunking, per-chunk progress
   - No timestamps in uploaded transcript: disable replay, show warning
@@ -127,7 +145,7 @@ POST /api/meetings/:id/upload
   - LLM rate limits: queue management, graceful degradation
 - Loading states, empty states, and error boundaries in UI
 
-**Deliverable**: Production-grade MVP ready for user testing.
+**Deliverable**: Production-grade MVP with quality scoring, user feedback loop, and style customization. Ready for user testing.
 
 ---
 
@@ -160,17 +178,27 @@ POST /api/meetings/:id/upload
 11. Wait 30+ days (or manually trigger lifecycle), verify file deletion
 
 ### 3.2 Technical Testing
-- **Unit tests**: provider abstraction, timestamp detection, individual graph nodes (mock LLM), JSONB minutes assembly, state reducer (`operator.add`)
+- **Unit tests**: provider abstraction, timestamp detection, individual graph nodes (mock LLM), JSONB minutes assembly, state reducer (`operator.add`), deterministic structural checks, LLM-as-judge scoring schema
 - **Graph structural tests**: verify graph compiles without cycles, conditional edges route correctly, `Send()` fan-out count matches agenda items
 - **Integration tests**: full graph invocation with mocked LLM calls, Celery task dispatch + result, file upload/download, auth flow, checkpoint save/restore on simulated crash
 - **LLM output validation**: schema conformance, source range bounds checking
 - **Progress streaming**: verify Redis pub/sub messages emitted at each node transition
 - **Performance**: <5 min total processing for a 2-hour meeting (parallel LLM calls via Send)
 
-### 3.3 Multi-language Testing
+### 3.3 Evaluation-Specific Testing
+- **Structural checks**: feed deliberately-broken minutes (missing section, out-of-bounds source range, missing speaker) → verify all errors/warnings fire correctly
+- **LLM-as-judge calibration**: run judge on a set of manually-scored sections → verify judge scores correlate with human scores (target: Pearson r > 0.7)
+- **Judge-provider separation**: verify judge uses a different model/provider than generation (config check)
+- **Score storage**: verify `generation_evals` populated after every generation
+- **Feedback round-trip**: submit user feedback via API → verify stored in `section_feedback` → verify queryable for analysis
+- **Style extraction**: upload example minutes → verify style profile JSON generated with all dimensions → regenerate with style → verify output reflects style delta
+- **Regression detection**: run generation with previous prompt version → compare scores → verify regression alert triggers on score drop > 0.5
+
+### 3.4 Multi-language Testing
 - Test with mixed Mandarin/English board meeting transcript
 - Verify minutes output in designated language
 - Verify speaker attribution preserved across language boundaries
+- Verify LLM-as-judge correctly evaluates non-English content
 
 ---
 
