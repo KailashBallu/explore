@@ -1,7 +1,7 @@
 # Meeting Intelligence — Technical Design Document
 
-> **Version:** 1.1  
-> **Date:** 2026-05-18  
+> **Version:** 1.2  
+> **Date:** 2026-05-21  
 > **Status:** Planning
 
 ---
@@ -24,7 +24,7 @@ Meeting Intelligence is a meeting minutes generation tool for companies. The pri
 ### 2.2 Input
 - **Recording** (audio/video) → tool invokes transcription with timestamps and speaker diarization
 - **Transcript** (text, timestamps optional) → user-provided; when timestamps missing, replay feature is disabled
-- **Agenda** → used to structure/chunk the minutes
+- **Agenda** (optional) → used to structure/chunk the minutes. If not provided, the system auto-generates one via topic detection and prompts the user to review it before generation proceeds (or auto-approves, depending on user config).
 - **Meeting metadata** → name, date/time, location/virtual, attendees list
 
 ### 2.3 Output
@@ -166,11 +166,16 @@ Provider is selected via config/env var. Single-file swap. Minimal cost (~50 lin
 
 ```sql
 -- Core tables
-users (id, email, password_hash, display_name, default_language, created_at)
+users (
+  id, email, password_hash, display_name, default_language,
+  settings JSONB,  -- user preferences: agenda_approval_mode, etc.
+  created_at
+)
 
 meetings (
   id, user_id, name, meeting_type, date, location,
-  language, agenda_text, status, created_at, updated_at
+  language, agenda_text, agenda_approval_mode,  -- null = use user default; "always_review" | "auto_approve"
+  status, created_at, updated_at
 )
 -- status: draft | processing | ready_review | signed | archived
 
@@ -294,11 +299,17 @@ class MinutesState(TypedDict):
     meeting_location: str
     meeting_type: str
     output_language: str
-    agenda_items: list[AgendaItem]
+    agenda_items: list[AgendaItem] | None  # None = agenda not yet provided/generated
     attendees: list[dict]
     has_recording: bool
     recording_storage_key: str | None
     transcript_text: str | None
+
+    # Agenda generation
+    has_agenda: bool
+    agenda_approval_mode: str  # "always_review" | "auto_approve"
+    agenda_confidence_scores: dict[int, float]  # per-item confidence (1-5)
+    agenda_review_approved: bool  # user confirmed in review_agenda node
 
     # Intermediate
     transcript_segments: list[TranscriptSegment]
@@ -334,6 +345,30 @@ class MinutesState(TypedDict):
                    │                           │
                    └───────────┬───────────────┘
                                ▼
+                    ┌──────────────────┐
+                    │   has_agenda?    │
+                    └───┬──────────┬───┘
+                        │ yes      │ no
+                        ▼          ▼
+                  ┌──────────┐  ┌─────────────────────┐
+                  │ (skip)   │  │  generate_agenda     │
+                  │          │  │  (LLM: topic detec-  │
+                  │          │  │   tion, section      │
+                  │          │  │   titles, confidence │
+                  │          │  │   scores per item)   │
+                  │          │  └──────────┬──────────┘
+                  │          │             │
+                  │          │             ▼
+                  │          │  ┌─────────────────────┐
+                  │          │  │  review_agenda       │
+                  │          │  │  (interrupt() if     │
+                  │          │  │   "always_review";   │
+                  │          │  │   skip if "auto_     │
+                  │          │  │   approve")          │
+                  │          │  └──────────┬──────────┘
+                  │          │             │
+                  └──────────┼─────────────┘
+                             ▼
                     ┌──────────────────┐
                     │  align_agenda    │
                     │ (LLM: map agenda │
@@ -379,13 +414,49 @@ class MinutesState(TypedDict):
 
 ### 6.4 Node Details
 
-**`validate_input`** — Deterministic. Checks required fields present, recording format supported, transcript encoding valid. Sets initial `status` and `progress`.
+**`validate_input`** — Deterministic. Checks required fields present, recording format supported, transcript encoding valid. Sets initial `status` and `progress`. Determines `has_agenda` from input: true if user uploaded an agenda (at least one non-empty agenda item), false otherwise.
 
 **`transcribe`** — Calls transcription provider (Deepgram/Whisper). Receives word-level timestamps + speaker diarization labels. Populates `transcript_segments`. On failure → retryable error.
 
 **`process_transcript`** — Parses user-uploaded transcript. Detects timestamp patterns (`HH:MM:SS`, `[00:00]`, `<00:00:00>`). If timestamps found → populates `transcript_segments` with times. If not → creates segments by paragraph with no timestamps, sets `has_timestamps = False`.
 
-**`align_agenda`** — LLM node. Maps each agenda item → relevant transcript segment indices. Segments not matching any agenda item go into "Other business." If no agenda provided, chunks by topic transitions. Uses structured JSON output.
+**`generate_agenda`** — LLM node. Runs only when `has_agenda` is false (no user-provided agenda). This is a first-class, quality-rigorous node, not a fallback path.
+
+Input: full `transcript_segments` list (or a windowed summary if transcript exceeds context window).
+
+Output:
+```python
+{
+    "items": [
+        {
+            "index": 0,
+            "title": "1. Financial Review",
+            "description": "Presentation and discussion of Q1 financial results",
+            "confidence": 5,
+            "boundary_segments": [0, 45],  # transcript segment indices for this topic
+            "boundary_rationale": "Clear transition: chair introduces next agenda topic"
+        },
+        ...
+    ],
+    "overall_confidence": 4.2
+}
+```
+
+LLM prompt design principles specific to this node:
+- Topic boundary detection is the primary task — the LLM looks for explicit transitions (chair introductions, "next item", "moving on to"), speaker changes coinciding with topic shifts, time gaps in conversation, and semantic distance between adjacent transcript blocks
+- Confidence scores (1–5) reflect how clear the boundary evidence is. High confidence means an unambiguous agenda-like transition phrase. Low confidence means the LLM guessed based on topic drift — these get visual warnings in the review UI
+- Section titles follow formal minutes conventions ("Financial Review", not "They talked about money")
+- Low-confidence items are still included — the user decides during review, not the LLM
+
+**`review_agenda`** — Human-in-the-loop node. Behavior depends on `agenda_approval_mode`:
+
+- `"always_review"` (default): calls `interrupt()` to yield control back to the frontend. The user sees the suggested agenda with confidence scores and can merge, split, rename, reorder, or delete items. The edited agenda is written into `state["agenda_items"]`. On resume, sets `agenda_review_approved = True`.
+
+- `"auto_approve"`: skips the interrupt entirely. The generated agenda is accepted as-is. Sets `agenda_review_approved = True` and continues directly.
+
+In both cases, when this node exits, `agenda_items` is guaranteed to be a non-empty list. This is the invariant downstream nodes rely on.
+
+**`align_agenda`** — LLM node. **Precondition: `agenda_items` is always populated** (either user-provided or generated+reviewed). Maps each agenda item → relevant transcript segment indices. Segments not matching any agenda item go into "Other business." Uses structured JSON output.
 
 **`summarize_agenda_item`** (fan-out via `Send()`) — One instance per agenda item, all in parallel. Each receives only its assigned transcript chunk. LLM generates: discussion summary, key points with speaker attribution, source segment references (character ranges + timestamps), in the specified output language.
 
@@ -397,9 +468,32 @@ class MinutesState(TypedDict):
 
 **`assemble_minutes`** — Deterministic. Compiles all `generated_sections` (collected via `operator.add` reducer) into the final JSONB structure. Adds header and attendance sections from input metadata.
 
-**`validate_minutes`** — Quality gate. Checks: all agenda items have summaries, source references within transcript bounds, speaker names populated (SEA requirement), no empty sections. If checks fail → conditional edge routes to repair node, then loops back.
+**`validate_minutes`** — Quality gate. Checks: all agenda items have summaries, source references within transcript bounds, speaker names populated (SEA requirement), no empty sections. When the agenda was auto-generated, also validates that confidence scores meet a minimum threshold on items flagged as "approved." If checks fail → conditional edge routes to repair node, then loops back.
 
-### 6.5 Progress Streaming
+### 6.5 Agenda Quality Evaluation
+
+Agenda quality is evaluated separately because the agenda is the load-bearing structure for all downstream generation — if it's wrong, nothing downstream can recover.
+
+**For auto-generated agendas (`generate_agenda` output):**
+
+| Check | Severity | Description |
+|-------|----------|-------------|
+| Overall confidence >= 3.0 | WARNING | If overall confidence is low, flag the entire agenda for careful review |
+| No single-item confidence = 1 | ERROR | A score of 1 means the LLM is guessing — reject the item, force the user to resolve it in review |
+| All items have non-empty titles | ERROR | Empty titles cannot be aligned or summarized |
+| Items collectively cover ≥85% of transcript | WARNING | Significant uncovered segments may indicate missed topics |
+| No overlapping boundaries | ERROR | Overlap means the same transcript content maps to multiple items — ambiguous downstream |
+
+**For user-provided agendas:**
+
+| Check | Severity | Description |
+|-------|----------|-------------|
+| All items referenceable in transcript | WARNING | An agenda item that has no corresponding discussion in the transcript — may indicate the meeting skipped that topic |
+| Agenda items ≥ 1 | ERROR | An empty agenda is not a valid input (user should use auto-generate instead) |
+
+These checks run in `validate_input` (for user-provided agendas) and as a sub-check within `generate_agenda` (for auto-generated ones). Low-confidence items receive a visual warning badge in the review UI.
+
+### 6.6 Progress Streaming
 
 LangGraph's `astream_events()` streams node transitions via Redis pub/sub → WebSocket:
 
@@ -413,11 +507,11 @@ async for event in graph.astream_events(initial_state, version="v2"):
         }))
 ```
 
-### 6.6 Checkpointing
+### 6.7 Checkpointing
 
 LangGraph checkpoints state after each node execution via `PostgresSaver`. If the Celery worker crashes mid-pipeline, the workflow resumes from the last checkpoint.
 
-### 6.7 LLM Prompt Design Principles
+### 6.8 LLM Prompt Design Principles
 - **Structured output**: Every LLM node uses JSON mode / function calling
 - **Source linking**: LLM returns character ranges in the transcript supporting each statement (citation-style)
 - **Speaker attribution**: From diarization labels + LLM inference; required by SEA jurisdictions
@@ -439,6 +533,10 @@ DELETE /api/meetings/:id                    # Delete meeting + files
 
 POST   /api/meetings/:id/upload             # Upload recording/transcript/attachment
 WS     /api/meetings/:id/status             # Stream processing status
+
+POST   /api/meetings/:id/agenda/suggest     # Trigger agenda generation from transcript
+GET    /api/meetings/:id/agenda/suggest     # Get suggested agenda (with confidence scores)
+PUT    /api/meetings/:id/agenda/suggest     # Submit edited agenda + approve, resume generation
 
 POST   /api/meetings/:id/generate           # Trigger minutes generation
 GET    /api/meetings/:id/minutes/latest     # Get latest minutes
@@ -465,9 +563,16 @@ Dashboard → Meeting List → Upload Flow → Minutes Review Editor → Export
 **Upload Flow** — Step-by-step wizard:
 1. Meeting metadata (name, date, type, language, location)
 2. Attendees (add names + roles, mark present/absent)
-3. Agenda (paste text or structured list)
+3. Agenda:
+   - **Paste agenda** (text or structured list) — the primary path for formal meetings
+   - **Skip** — if no agenda is available, the system will auto-generate one from the transcript/recording. The agenda step shows:
+     - A "Suggest from transcript" button (disabled until transcript/recording is uploaded)
+     - A setting: **Approval mode** — "Always review suggested agenda" (default) or "Auto-approve and proceed." This can be pre-set at the user level and overridden per meeting.
+     - A timeline note when recording is the input: "Your meeting will be transcribed first, then we'll suggest an agenda. With auto-approve, generation proceeds without waiting for you."
 4. Upload recording and/or transcript
 5. Confirm & start generation
+
+When the user skips the agenda and uses "Suggest from transcript," the `generate_agenda` node produces a structured agenda with confidence scores per item. If approval mode is "always review," the wizard pauses after suggestion and shows the agenda for editing before proceeding to full generation.
 
 **Review Editor** — The core experience:
 ```
