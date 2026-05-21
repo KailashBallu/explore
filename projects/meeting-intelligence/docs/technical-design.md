@@ -1,6 +1,6 @@
 # Meeting Intelligence — Technical Design Document
 
-> **Version:** 1.2  
+> **Version:** 1.3  
 > **Date:** 2026-05-21  
 > **Status:** Planning
 
@@ -134,6 +134,7 @@ Meeting Intelligence is a meeting minutes generation tool for companies. The pri
 | **Database** | PostgreSQL 16 | JSONB for minutes structure, full-text search; LangGraph checkpoint storage |
 | **Object storage** | S3-compatible (MinIO for local dev) | Lifecycle policies for 30-day auto-delete |
 | **Transcription** | Deepgram (primary) or OpenAI Whisper | Both provide word-level timestamps + diarization |
+| **Media preprocessing** | ffmpeg (libavcodec/libavformat) | Extract audio from video containers, normalize sample rate to 16kHz mono, transcode to provider-compatible format |
 | **LLM** | OpenAI GPT-4o (initial), with provider abstraction | Structured output via JSON mode / function calling |
 | **Frontend** | React 19 + Vite + TypeScript | Fast dev, typed |
 | **UI components** | shadcn/ui + Tailwind CSS | Clean, customizable |
@@ -338,12 +339,19 @@ class MinutesState(TypedDict):
                     │ has_recording?              │ no recording
                     ▼                             ▼
           ┌──────────────────┐        ┌───────────────────┐
-          │   transcribe      │        │ process_transcript │
-          │ (Deepgram/Whisper)│        │ (parse + timestamp │
-          └────────┬─────────┘        │  detection)        │
-                   │                  └────────┬──────────┘
-                   │                           │
-                   └───────────┬───────────────┘
+          │ preprocess_media  │        │ process_transcript │
+          │ (ffmpeg: extract  │        │ (parse + timestamp │
+          │  audio, normalize │        │  detection)        │
+          │  to 16kHz mono)   │        └────────┬──────────┘
+          └────────┬─────────┘                  │
+                   │                            │
+                   ▼                            │
+          ┌──────────────────┐                  │
+          │   transcribe      │                  │
+          │ (Deepgram/Whisper)│                  │
+          └────────┬─────────┘                  │
+                   │                            │
+                   └───────────┬────────────────┘
                                ▼
                     ┌──────────────────┐
                     │   has_agenda?    │
@@ -414,9 +422,20 @@ class MinutesState(TypedDict):
 
 ### 6.4 Node Details
 
-**`validate_input`** — Deterministic. Checks required fields present, recording format supported, transcript encoding valid. Sets initial `status` and `progress`. Determines `has_agenda` from input: true if user uploaded an agenda (at least one non-empty agenda item), false otherwise.
+**`validate_input`** — Deterministic. Checks required fields present, file uploads exist and are non-empty, transcript encoding valid. Sets initial `status` and `progress`. Determines `has_agenda` from input: true if user uploaded an agenda (at least one non-empty agenda item), false otherwise.
 
-**`transcribe`** — Calls transcription provider (Deepgram/Whisper). Receives word-level timestamps + speaker diarization labels. Populates `transcript_segments`. On failure → retryable error.
+**`preprocess_media`** — Deterministic. Runs only when `has_recording` is true. Uses ffmpeg to normalize the uploaded recording into a consistent format before transcription. This node is the input-format boundary — everything downstream can assume a known audio format regardless of what the user uploaded.
+
+Operations performed:
+- **Video demuxing**: If the recording is a video container (`.mp4`, `.mov`, `.avi`, `.mkv`, `.webm`), extract the primary audio stream. Video track is discarded — no video features in v1.
+- **Audio transcoding**: Transcode to 16kHz mono FLAC (lossless, widely accepted by both Deepgram and Whisper). Handles arbitrary input codecs (MP3, AAC, Opus, Vorbis, WMA, etc.).
+- **Sample rate normalization**: Resample to 16kHz (both providers' recommended rate). Low sample rates (e.g., 8kHz conference recordings) get upsampled with appropriate filtering; high sample rates (44.1kHz, 48kHz) get downsampled.
+- **Channel reduction**: Stereo/multi-channel → mono. In v1, diarization is handled entirely by the transcription provider, so channel-based speaker separation is not used.
+- **Validation**: Detect silent/empty audio (output duration < 1s → error), verify output file is within provider size limits, report original and normalized durations.
+
+ffmpeg runs as a subprocess; the normalized file is written to temp storage and cleaned up after transcription completes (or on failure). This node updates `state["recording_storage_key"]` to point to the normalized file.
+
+**`transcribe`** — Calls transcription provider (Deepgram/Whisper) with the preprocessed, normalized audio file. Receives word-level timestamps + speaker diarization labels. Populates `transcript_segments`. On failure → retryable error.
 
 **`process_transcript`** — Parses user-uploaded transcript. Detects timestamp patterns (`HH:MM:SS`, `[00:00]`, `<00:00:00>`). If timestamps found → populates `transcript_segments` with times. If not → creates segments by paragraph with no timestamps, sets `has_timestamps = False`.
 

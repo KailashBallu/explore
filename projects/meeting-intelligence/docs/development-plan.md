@@ -58,6 +58,13 @@ POST /api/meetings/:id/upload
 **Goal**: Convert recordings into structured transcripts with timestamps and speaker labels.
 
 - Provider abstraction layer (transcription interface + LLM interface)
+- **Media preprocessing pipeline** (ffmpeg):
+  - Extract audio stream from video containers (`.mp4`, `.mov`, `.avi`, `.mkv`, `.webm`)
+  - Audio format transcoding: accept arbitrary codecs (MP3, AAC, Opus, Vorbis, WMA, FLAC, etc.), output 16kHz mono FLAC
+  - Sample rate normalization: resample to 16kHz regardless of input (upsample low-rate conference recordings, downsample 44.1/48kHz)
+  - Channel reduction: stereo/multi-channel → mono
+  - Validation: silent/empty audio detection, provider size limit checks, duration verification
+  - Temp storage for normalized file, cleanup after transcription
 - Recording → transcription via Deepgram (primary) or OpenAI Whisper (fallback)
   - Word-level timestamps
   - Speaker diarization
@@ -65,7 +72,7 @@ POST /api/meetings/:id/upload
   - Support formats: `HH:MM:SS`, `[00:00]`, `<00:00:00>`, SRT, VTT
   - Graceful handling when no timestamps found
 
-**Deliverable**: Upload a recording → get a transcript with timestamps and speaker labels stored in DB and object storage.
+**Deliverable**: Upload a recording in any common format → get a transcript with timestamps and speaker labels stored in DB and object storage.
 
 ---
 
@@ -74,8 +81,9 @@ POST /api/meetings/:id/upload
 **Goal**: Multi-step agentic workflow that transforms transcript + metadata into structured minutes with automated quality evaluation.
 
 - Define `MinutesState` TypedDict and state schema
-- Implement all 10 graph nodes:
+- Implement all 11 graph nodes:
   - `validate_input` — deterministic validation
+  - `preprocess_media` — ffmpeg: extract audio, normalize to 16kHz mono
   - `transcribe` — transcription service call
   - `process_transcript` — parse uploaded transcript
   - `align_agenda` — LLM: map agenda items to transcript segments
@@ -166,19 +174,20 @@ POST /api/meetings/:id/upload
 
 ### 3.1 Functional Testing (end-to-end)
 1. Create a test meeting with full metadata, attendees, agenda
-2. Upload a sample recording (pre-recorded mock board meeting, ~20 min)
-3. Verify transcription includes timestamps and speaker labels
-4. Trigger generation, verify all section types appear in output
-5. In review editor: click a generated point, verify transcript highlights correctly
-6. Click replay, verify recording plays from correct timestamp
-7. Edit a discussion summary in the editor, verify auto-save
-8. Export as DOCX and PDF, verify formatting
-9. Upload transcript-only (no timestamps), verify minutes still generate without replay
-10. Upload transcript with timestamps, verify traceability works
-11. Wait 30+ days (or manually trigger lifecycle), verify file deletion
+2. Upload a sample recording (pre-recorded mock board meeting, ~20 min) in **video format (MP4)** — verify audio extraction and normalization
+3. Repeat with **audio-only formats** (MP3, WAV at various sample rates) — verify normalization to 16kHz mono
+4. Verify transcription includes timestamps and speaker labels
+5. Trigger generation, verify all section types appear in output
+6. In review editor: click a generated point, verify transcript highlights correctly
+7. Click replay, verify recording plays from correct timestamp
+8. Edit a discussion summary in the editor, verify auto-save
+9. Export as DOCX and PDF, verify formatting
+10. Upload transcript-only (no timestamps), verify minutes still generate without replay
+11. Upload transcript with timestamps, verify traceability works
+12. Wait 30+ days (or manually trigger lifecycle), verify file deletion
 
 ### 3.2 Technical Testing
-- **Unit tests**: provider abstraction, timestamp detection, individual graph nodes (mock LLM), JSONB minutes assembly, state reducer (`operator.add`), deterministic structural checks, LLM-as-judge scoring schema
+- **Unit tests**: provider abstraction, timestamp detection, individual graph nodes (mock LLM), JSONB minutes assembly, state reducer (`operator.add`), deterministic structural checks, LLM-as-judge scoring schema, **media preprocessing (ffmpeg pipeline: video demuxing, format transcoding, sample rate conversion, channel reduction, silent audio detection)**
 - **Graph structural tests**: verify graph compiles without cycles, conditional edges route correctly, `Send()` fan-out count matches agenda items
 - **Integration tests**: full graph invocation with mocked LLM calls, Celery task dispatch + result, file upload/download, auth flow, checkpoint save/restore on simulated crash
 - **LLM output validation**: schema conformance, source range bounds checking
@@ -206,6 +215,6 @@ POST /api/meetings/:id/upload
 
 1. **Chat vs traditional UI**: Build the chat interface in Phase 6 or bring it forward? The user expressed interest in chat-based interaction. Architecture supports both (same API, different frontend shell).
 
-2. **Transcription provider for SEA languages**: Deepgram vs Whisper accuracy for SEA languages (Thai, Vietnamese, Bahasa, etc.) — needs evaluation before committing to a provider.
+2. **Transcription provider for SEA languages**: Deepgram vs Whisper accuracy for SEA languages (Thai, Vietnamese, Bahasa, etc.) — needs evaluation before committing to a provider. Preprocessing normalizes all audio to 16kHz mono, so format support shouldn't be a deciding factor.
 
-3. **Meeting length extremes**: The plan handles 4-hour meetings with increased chunking. Any known scenarios exceeding 6 hours? This would need a multi-stage summarization approach.
+3. **Meeting length extremes**: The plan handles 4-hour meetings with increased chunking. Any known scenarios exceeding 6 hours? This would need a multi-stage summarization approach. Large recordings also raise ffmpeg processing time and temp storage concerns — a 6-hour video may take minutes just to extract and normalize audio.
