@@ -1,6 +1,6 @@
 # Meeting Intelligence — Technical Design Document
 
-> **Version:** 1.3  
+> **Version:** 1.4  
 > **Date:** 2026-05-21  
 > **Status:** Planning
 
@@ -135,6 +135,7 @@ Meeting Intelligence is a meeting minutes generation tool for companies. The pri
 | **Object storage** | S3-compatible (MinIO for local dev) | Lifecycle policies for 30-day auto-delete |
 | **Transcription** | Deepgram (primary) or OpenAI Whisper | Both provide word-level timestamps + diarization |
 | **Media preprocessing** | ffmpeg (libavcodec/libavformat) | Extract audio from video containers, normalize sample rate to 16kHz mono, transcode to provider-compatible format |
+| **Transcript normalization** | Python (stdlib + regex) | Canonicalize uploaded transcripts: whitespace, line endings, encoding, speaker labels, timestamps, artifacts |
 | **LLM** | OpenAI GPT-4o (initial), with provider abstraction | Structured output via JSON mode / function calling |
 | **Frontend** | React 19 + Vite + TypeScript | Fast dev, typed |
 | **UI components** | shadcn/ui + Tailwind CSS | Clean, customizable |
@@ -340,8 +341,8 @@ class MinutesState(TypedDict):
                     ▼                             ▼
           ┌──────────────────┐        ┌───────────────────┐
           │ preprocess_media  │        │ process_transcript │
-          │ (ffmpeg: extract  │        │ (parse + timestamp │
-          │  audio, normalize │        │  detection)        │
+          │ (ffmpeg: extract  │        │ (normalize + parse │
+          │  audio, normalize │        │  + timestamp det.) │
           │  to 16kHz mono)   │        └────────┬──────────┘
           └────────┬─────────┘                  │
                    │                            │
@@ -437,7 +438,31 @@ ffmpeg runs as a subprocess; the normalized file is written to temp storage and 
 
 **`transcribe`** — Calls transcription provider (Deepgram/Whisper) with the preprocessed, normalized audio file. Receives word-level timestamps + speaker diarization labels. Populates `transcript_segments`. On failure → retryable error.
 
-**`process_transcript`** — Parses user-uploaded transcript. Detects timestamp patterns (`HH:MM:SS`, `[00:00]`, `<00:00:00>`). If timestamps found → populates `transcript_segments` with times. If not → creates segments by paragraph with no timestamps, sets `has_timestamps = False`.
+**`process_transcript`** — Normalizes and parses a user-uploaded transcript into canonical `transcript_segments`. This node is the text-format boundary — everything downstream can assume clean, consistent transcript text regardless of source.
+
+The node runs in two phases: normalization first, then segmentation.
+
+**Phase 1 — Normalization.** User-uploaded transcripts arrive in varied formats (Zoom exports, Rev/Otter/Sonix outputs, plain text, SRT, VTT). Without normalization, downstream LLM nodes receive inconsistent text, and the character-offset traceability feature breaks because offsets computed by the LLM won't match the actual source text. Normalization happens in a fixed order:
+
+1. **Encoding**: detect and convert to UTF-8 (handle BOM, Latin-1, Shift-JIS, GB2312, etc.).
+2. **Line endings**: normalize `\r\n` and legacy `\r` to `\n`.
+3. **Artifact stripping**: remove non-dialogue cruft specific to common providers — Zoom metadata headers/footers, Rev page numbers and headers, Otter session banners, VTT/SRT metadata blocks. Detection is provider-agnostic (heuristic: lines that look like metadata rather than speech), with explicit patterns for known formats.
+4. **Whitespace**: collapse runs of multiple spaces/tabs within lines, trim leading/trailing whitespace per line, collapse runs of 3+ blank lines to 2 (preserving intentional paragraph breaks).
+5. **Timestamp inlining**: some services inline timestamps within speech lines (e.g., `"00:05:23 so as I was saying 00:05:27 the results are..."`). After extracting timestamp data for segment boundaries, strip these inline timestamps from the text.
+6. **Speaker label normalization**: detect common speaker-label conventions and normalize to a canonical `"Name: text"` format:
+   - `Speaker 1:`, `Speaker A:`, `SPEAKER:` → detect and preserve as-is (anonymous labels are valid)
+   - `[Alice]:`, `**Bob**:`, `<Carol>:` → strip markup, normalize to `Alice:` / `Bob:` / `Carol:`
+   - `(00:05:23) Alice: text` → strip leading timestamp, keep `Alice: text`
+   - Mixed conventions within one transcript → normalize all to the same format
+
+The output of Phase 1 is a single canonical text string with all source-specific formatting removed. This is what gets stored and what all downstream nodes consume. The original uploaded file is preserved in object storage for audit purposes.
+
+**Phase 2 — Segmentation.** Parses the normalized text into `TranscriptSegment` entries:
+
+- **With timestamps**: detects patterns (`HH:MM:SS`, `[HH:MM:SS]`, `<HH:MM:SS>`, SRT blocks, VTT blocks). Populates `transcript_segments` with `start_time`/`end_time` from the detected timestamps. Sets `has_timestamps = True`.
+- **Without timestamps**: splits by paragraph/speaker-turn boundaries. All time fields are `None`. Sets `has_timestamps = False`, which disables the replay feature in the frontend.
+
+After this node, `transcript_segments` is canonical: consistent whitespace, UTF-8, uniform speaker labels, no inline timestamps or metadata artifacts. Every downstream node — `generate_agenda`, `align_agenda`, `summarize_agenda_item`, `extract_*` — can trust that character offsets are stable and text is clean.
 
 **`generate_agenda`** — LLM node. Runs only when `has_agenda` is false (no user-provided agenda). This is a first-class, quality-rigorous node, not a fallback path.
 
@@ -805,3 +830,5 @@ POST   /api/users/me/style-profile/samples          # Upload example minutes for
 | 30-day deletion | S3 lifecycle policies | Automatic, reliable |
 | Frontend approach | Traditional UI first, chat later | Core review experience needs rich editor |
 | Speaker attribution | Diarization labels + LLM inference | Required by SEA jurisdictions |
+| Input-format boundaries | Explicit normalization nodes at system entry points | Audio: ffmpeg → 16kHz mono FLAC. Text: normalize whitespace, encoding, speaker labels, artifacts. Downstream nodes never handle source-specific formats |
+| Transcript normalization scope | Text only, not semantics | Don't alter word choice, correct grammar, or rephrase. The canonical transcript is a faithful representation of what was said — just with consistent formatting |
