@@ -1,5 +1,9 @@
 # CLAUDE.md
 
+## Branch Strategy
+- Always create a feature branch for new work — never commit directly to master.
+- Branch names should be short and descriptive, using kebab-case (e.g., `add-auth-middleware`, `fix-race-condition`).
+
 ## Commit Rules
 - Never include "Co-Authored-By: Claude" or similar credits in commit messages.
 
