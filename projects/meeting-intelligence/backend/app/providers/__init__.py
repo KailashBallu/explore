@@ -1,0 +1,6 @@
+from typing import Protocol
+
+
+class LLMProvider(Protocol):
+    async def chat_completion(self, messages: list, schema: dict | None = None) -> dict: ...
+    async def streaming_completion(self, messages: list): ...
