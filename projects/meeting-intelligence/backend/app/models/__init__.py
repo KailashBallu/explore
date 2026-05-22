@@ -1,12 +1,25 @@
 from app.models.base import (
-    User,
+    ActionItem,
+    GenerationEval,
     Meeting,
     MeetingAttendee,
     MeetingFile,
     Minutes,
     MinutesSection,
-    ActionItem,
-    GenerationEval,
     SectionFeedback,
+    User,
     UserStyleProfile,
 )
+
+__all__ = [
+    "User",
+    "Meeting",
+    "MeetingAttendee",
+    "MeetingFile",
+    "Minutes",
+    "MinutesSection",
+    "ActionItem",
+    "GenerationEval",
+    "SectionFeedback",
+    "UserStyleProfile",
+]

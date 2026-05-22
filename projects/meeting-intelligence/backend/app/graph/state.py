@@ -1,6 +1,5 @@
-from typing import Annotated, TypedDict
-
 import operator
+from typing import Annotated, TypedDict
 
 
 class TranscriptSegment(TypedDict):
