@@ -1,5 +1,6 @@
 import uuid
 from datetime import datetime
+from typing import Any
 
 from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB
@@ -22,7 +23,7 @@ class User(Base):
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     display_name: Mapped[str] = mapped_column(String(255), nullable=False)
     default_language: Mapped[str] = mapped_column(String(10), default="en")
-    settings: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    settings: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -34,7 +35,9 @@ class Meeting(Base):
     __tablename__ = "meetings"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=gen_uuid)
-    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False, index=True)
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id"), nullable=False, index=True
+    )
     name: Mapped[str] = mapped_column(String(500), nullable=False)
     meeting_type: Mapped[str | None] = mapped_column(String(100), nullable=True)
     date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -51,10 +54,18 @@ class Meeting(Base):
     )
 
     user = relationship("User", back_populates="meetings")
-    attendees = relationship("MeetingAttendee", back_populates="meeting", cascade="all, delete-orphan")
-    files = relationship("MeetingFile", back_populates="meeting", cascade="all, delete-orphan")
-    minutes = relationship("Minutes", back_populates="meeting", cascade="all, delete-orphan")
-    action_items = relationship("ActionItem", back_populates="meeting", cascade="all, delete-orphan")
+    attendees = relationship(
+        "MeetingAttendee", back_populates="meeting", cascade="all, delete-orphan"
+    )
+    files = relationship(
+        "MeetingFile", back_populates="meeting", cascade="all, delete-orphan"
+    )
+    minutes = relationship(
+        "Minutes", back_populates="meeting", cascade="all, delete-orphan"
+    )
+    action_items = relationship(
+        "ActionItem", back_populates="meeting", cascade="all, delete-orphan"
+    )
 
 
 class MeetingAttendee(Base):
@@ -99,7 +110,7 @@ class Minutes(Base):
     )
     version: Mapped[int] = mapped_column(Integer, default=1)
     status: Mapped[str] = mapped_column(String(20), default="draft")
-    content: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    content: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -108,7 +119,9 @@ class Minutes(Base):
     )
 
     meeting = relationship("Meeting", back_populates="minutes")
-    sections = relationship("MinutesSection", back_populates="minutes", cascade="all, delete-orphan")
+    sections = relationship(
+        "MinutesSection", back_populates="minutes", cascade="all, delete-orphan"
+    )
 
 
 class MinutesSection(Base):
@@ -122,7 +135,7 @@ class MinutesSection(Base):
     ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
     heading: Mapped[str | None] = mapped_column(String(500), nullable=True)
     body_html: Mapped[str | None] = mapped_column(Text, nullable=True)
-    body_json: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    body_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     source_start_char: Mapped[int | None] = mapped_column(Integer, nullable=True)
     source_end_char: Mapped[int | None] = mapped_column(Integer, nullable=True)
     source_start_time: Mapped[str | None] = mapped_column(String(20), nullable=True)
@@ -172,7 +185,7 @@ class GenerationEval(Base):
     language_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     conciseness_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     judge_model: Mapped[str | None] = mapped_column(String(100), nullable=True)
-    judge_raw_response: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    judge_raw_response: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -202,8 +215,8 @@ class UserStyleProfile(Base):
     user_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, unique=True
     )
-    style_config: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
-    source_minutes_ids: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    style_config: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    source_minutes_ids: Mapped[list[Any] | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

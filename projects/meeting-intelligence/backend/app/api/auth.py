@@ -4,15 +4,15 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 
 @router.post("/login")
-async def login():
+async def login() -> None:
     pass
 
 
 @router.post("/refresh")
-async def refresh():
+async def refresh() -> None:
     pass
 
 
 @router.post("/logout")
-async def logout():
+async def logout() -> None:
     pass

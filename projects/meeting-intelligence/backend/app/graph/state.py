@@ -1,6 +1,5 @@
-from typing import Annotated, TypedDict
-
 import operator
+from typing import Annotated, Any, TypedDict
 
 
 class TranscriptSegment(TypedDict):
@@ -23,8 +22,8 @@ class GeneratedSection(TypedDict):
     ordinal: int
     heading: str
     body_html: str
-    body_json: dict
-    source_segments: list[dict]
+    body_json: dict[str, Any]
+    source_segments: list[dict[str, Any]]
     speaker_name: str | None
 
 
@@ -37,7 +36,7 @@ class MinutesState(TypedDict):
     meeting_type: str
     output_language: str
     agenda_items: list[AgendaItem] | None
-    attendees: list[dict]
+    attendees: list[dict[str, Any]]
     has_recording: bool
     recording_storage_key: str | None
     transcript_text: str | None
@@ -51,11 +50,11 @@ class MinutesState(TypedDict):
     # Intermediate
     transcript_segments: list[TranscriptSegment]
     has_timestamps: bool
-    agenda_alignment: dict
+    agenda_alignment: dict[str, Any]
     generated_sections: Annotated[list[GeneratedSection], operator.add]
 
     # Output
-    assembled_minutes: dict | None
+    assembled_minutes: dict[str, Any] | None
     validation_errors: list[str]
 
     # Control
